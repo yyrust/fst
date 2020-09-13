@@ -2,6 +2,9 @@
 pub use self::levenshtein::{Levenshtein, LevenshteinError};
 
 #[cfg(feature = "levenshtein")]
+mod utf8_matcher;
+
+#[cfg(feature = "levenshtein")]
 mod levenshtein;
 
 /// Automaton describes types that behave as a finite automaton.

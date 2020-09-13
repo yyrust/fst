@@ -2,9 +2,11 @@ use std::cmp;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io::Write;
 
 use utf8_ranges::{Utf8Range, Utf8Sequences};
 
+use super::utf8_matcher::{find_utf8_path, TransitionTable, Transitions};
 use crate::automaton::Automaton;
 
 const STATE_LIMIT: usize = 10_000; // currently at least 20MB >_<
@@ -120,6 +122,16 @@ impl Levenshtein {
         let dfa = DfaBuilder::new(lev.clone()).build()?;
         Ok(Levenshtein { prog: lev, dfa })
     }
+
+    /// Generate graph to `w` for the automaton in DOT language.
+    #[inline]
+    pub fn to_graphviz(
+        &self,
+        name: &str,
+        w: &mut dyn Write,
+    ) -> std::io::Result<()> {
+        self.dfa.to_graphviz(name, w)
+    }
 }
 
 impl fmt::Debug for Levenshtein {
@@ -194,9 +206,166 @@ struct Dfa {
     states: Vec<State>,
 }
 
+impl Dfa {
+    pub fn to_graphviz(
+        &self,
+        name: &str,
+        w: &mut dyn Write,
+    ) -> std::io::Result<()> {
+        let mut transition_table =
+            TransitionTable::with_capacity(self.states.len());
+        w.write_fmt(format_args!("digraph {} {{\n", name))?;
+        for (i, s) in self.states.iter().enumerate() {
+            s.to_graphviz(i, w)?;
+
+            // transitions for the state
+            let mut transitions = Transitions::default();
+            let clusters = s.clusters();
+            for cl in clusters
+                .iter()
+                .filter(|c| c.from + 1 == c.to && c.value.is_some())
+            {
+                transitions.push((cl.from as u8, cl.value.unwrap()));
+            }
+            transition_table.push(transitions);
+        }
+
+        // Find paths which match a multi-byte utf-8 character, and generate blue dashed lines to
+        // visualize them.
+        find_utf8_path(&transition_table, &mut |start, end, chr| {
+            w.write_fmt(format_args!("S{} -> S{} [color=blue, constrant=false, label=<<font color='blue'>{}</font>>, style=dashed];\n", start, end, chr)).expect("write virtual path error");
+        });
+
+        w.write_fmt(format_args!("}}\n"))
+    }
+}
+
 struct State {
     next: [Option<usize>; 256],
     is_match: bool,
+}
+
+struct StateCluster {
+    pub from: usize,
+    pub to: usize,
+    pub value: Option<usize>,
+}
+
+impl StateCluster {
+    pub fn edge_label(&self) -> String {
+        if self.from + 1 == self.to {
+            // single char
+            let c = self.from;
+            let printable = c >= 0x20 && c <= 0x7e;
+            if printable {
+                format!("0x{:X} ('{}')", self.from, c as u8 as char)
+            } else {
+                format!("0x{:X}", self.from)
+            }
+        } else {
+            // char range
+            format!("[{:X}-{:X}]", self.from, self.to - 1)
+        }
+    }
+    pub fn edge_target(&self) -> String {
+        match self.value {
+            Some(v) => format!("S{}", v),
+            None => "None".to_string(),
+        }
+    }
+    pub fn edge_color(&self) -> &str {
+        if self.from + 1 == self.to {
+            "red"
+        } else {
+            "black"
+        }
+    }
+}
+
+impl fmt::Debug for StateCluster {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}, {}): ", self.from, self.to)?;
+        match self.value {
+            Some(x) => write!(f, "{}", x),
+            None => write!(f, "None"),
+        }
+    }
+}
+
+impl State {
+    pub fn clusters(&self) -> Vec<StateCluster> {
+        let mut prev_idx = 0;
+        let mut prev = self.next[0];
+        let mut clusters = vec![];
+        for i in 1..self.next.len() {
+            let curr = self.next[i];
+            if curr != prev {
+                clusters.push(StateCluster {
+                    from: prev_idx,
+                    to: i,
+                    value: prev,
+                });
+                prev = curr;
+                prev_idx = i;
+            }
+        }
+        clusters.push(StateCluster {
+            from: prev_idx,
+            to: self.next.len(),
+            value: *self.next.last().unwrap(),
+        });
+        clusters
+    }
+    pub fn to_graphviz(
+        &self,
+        id: usize,
+        w: &mut dyn Write,
+    ) -> std::io::Result<()> {
+        let shape = if self.is_match { "box" } else { "circle" };
+        w.write_fmt(format_args!("S{} [shape=\"{}\"];\n", id, shape))?;
+        let clusters = self.clusters();
+        for cl in clusters {
+            if cl.value.is_none() {
+                continue;
+            }
+            let target = cl.edge_target();
+            let label = cl.edge_label();
+            let color = cl.edge_color();
+            w.write_fmt(format_args!(
+                "S{} -> {} [label=<<font color='{}'>{}</font>>, color=\"{}\"];\n",
+                id, target, color, label, color
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+impl PartialEq for State {
+    fn eq(&self, other: &State) -> bool {
+        if self.is_match != other.is_match {
+            return false;
+        }
+        for i in 0..256 {
+            if self.next[i] != other.next[i] {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+impl Eq for State {}
+
+impl std::hash::Hash for State {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for n in self.next.iter() {
+            match n {
+                Some(si) => state.write_usize(*si),
+                None => state.write_isize(-1isize),
+            }
+        }
+        state.write_u8(if self.is_match { 1 } else { 0 });
+    }
 }
 
 impl fmt::Debug for State {
